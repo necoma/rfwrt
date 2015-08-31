@@ -4,6 +4,7 @@
 
 import json
 import struct
+import commands
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -14,8 +15,10 @@ from ryu.ofproto import ofproto_v1_0
 from ryu.lib import addrconv
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import arp
+from ryu.lib.packet import ipv4
 
 
 from webob.response import Response
@@ -26,6 +29,12 @@ from ryu.app.wsgi import (
 
 PRIO_DEFAULT_FLOW = 0x0001
 PRIO_BLOCK_FLOW   = 0x0010
+PRIO_HIGH_FLOW    = 0x0100
+
+SSH_KEY = "~/.ssh/id_rsa_nopass"
+SSH_USR = "root"
+SSH_DST = "10.0.1.1"
+
 
 def ipv4_text_to_int(ip_text):
     if ip_text == 0:
@@ -45,6 +54,7 @@ class RFWRT (app_manager.RyuApp) :
     def __init__ (self, *args, **kwargs) :
         super (RFWRT, self).__init__ (*args, **kwargs)
         self.fdb = {} # mac -> portnum
+        self.arp = {} # ip -> mac for arp spoofing
         self.blocked_ip = set () # block IP address
         self.wsgi = kwargs['wsgi']
         self.datapath = None  # dp_handler will overwrite
@@ -62,6 +72,15 @@ class RFWRT (app_manager.RyuApp) :
                         controller = RestApi,
                         action = 'del_blocking_ip',
                         conditions = dict (method = ['PUT']))
+        mapper.connect ('deassoc_client', "/deassoc_client/{ipaddr}",
+                        controller = RestApi,
+                        action = 'deassoc_client',
+                        conditions = dict (method = ['PUT']))
+        mapper.connect ('list_client', "/list_client",
+                        controller = RestApi,
+                        action = 'list_client',
+                        conditions = dict (method = ['PUT']))
+
         return
 
 
@@ -124,16 +143,30 @@ class RFWRT (app_manager.RyuApp) :
         return
 
 
+    def deassoc_client (self, ipaddr) :
+
+        macaddr = self.arp[ipaddr]
+        sshstr = "ssh -o %s -i %s -l %s %s %s" % (
+            "\"StrictHostKeyChecking no\"", SSH_KEY, SSH_USR, SSH_DST,
+            "iw dev wlan0 station del %s" % macaddr)
+        
+        print "Exec: %s" % sshstr
+        res = commands.getoutput (sshstr)
+        print "Output: %s" % res
+        return
+        
+
+
     def add_flow (self, datapath, match, actions,
-                  priority = PRIO_DEFAULT_FLOW) :
+                  priority = PRIO_DEFAULT_FLOW, idle = 0, hard = 0) :
 
         ofproto = datapath.ofproto
 
         mod = datapath.ofproto_parser.OFPFlowMod (
             datapath = datapath, match = match, cookie = 0,
-            command = ofproto.OFPFC_ADD, idle_timeout = 0, hard_timeout = 0,
-            priority = priority, flags = ofproto.OFPFF_SEND_FLOW_REM,
-            actions = actions)
+            command = ofproto.OFPFC_ADD, idle_timeout = idle,
+            hard_timeout = hard, priority = priority,
+            flags = ofproto.OFPFF_SEND_FLOW_REM, actions = actions)
 
         datapath.send_msg (mod)
         return
@@ -163,6 +196,19 @@ class RFWRT (app_manager.RyuApp) :
         if eth.ethertype == ether_types.ETH_TYPE_LLDP :
             return
 
+        if eth.ethertype == ether_types.ETH_TYPE_ARP :
+            # ARP snooping
+            arp_pkt = pkt.get_protocol (arp.arp)
+            if arp_pkt.opcode == arp.ARP_REPLY or \
+               arp_pkt.opcode == arp.ARP_REQUEST :
+                self.arp[arp_pkt.src_ip] = arp_pkt.src_mac
+
+        if eth.ethertype == ether_types.ETH_TYPE_IP :
+            # src ip snooping 
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            if ip_pkt.tos > 60 :
+                self.arp[ip_pkt.src] = eth.src
+                    
         dst = eth.dst
         src = eth.src
 
@@ -211,6 +257,7 @@ class RFWRT (app_manager.RyuApp) :
         else:
             print ("Illeagal port state %s %s", port_no, reason)
 
+
         return
 
     @set_ev_cls (ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -220,6 +267,15 @@ class RFWRT (app_manager.RyuApp) :
         print ("Switch [%d] is connected." % dpid)
         self.datapath = ev.msg.datapath
         print "and datapath is set"
+
+        datapath = ev.msg.datapath
+
+        match = datapath.ofproto_parser.OFPMatch (
+            dl_type = ether_types.ETH_TYPE_ARP)
+        actions = [datapath.ofproto_parser.OFPActionOutput (
+            datapath.ofproto.OFPP_CONTROLLER)]
+
+        self.add_flow (datapath, match, actions, priority = PRIO_HIGH_FLOW)
 
         return
 
@@ -266,11 +322,34 @@ class RestApi (ControllerBase) :
 
         if not self.rfwrt.blocking_ip_exist (ipaddr) :
             jsondict = { "error" : "%s does not exist." % ipaddr }
-            return Response (content_type = "application/json",
-                             body = json.dumps (jsondict, indent = 4))
+
         else :
             self.rfwrt.del_blocking_ip (ipaddr)
             jsondict = { "success" : "%s is deleted." % ipaddr }
 
         return Response (content_type = "application/json",
                          body = json.dumps (jsondict, indent = 4))
+
+
+    def deassoc_client (self, req, ipaddr, ** _kwargs) :
+
+        print "deassoc_client %s" % ipaddr
+
+        if not self.rfwrt.arp.has_key (ipaddr) :
+            jsondict = { "error" : "arp entry for %s is not found." }
+
+        else :
+            self.rfwrt.deassoc_client (ipaddr)
+            jsondict = { "success" : "%s deassoc %s, %s" %
+                         (ipaddr, ipaddr, self.rfwrt.arp[ipaddr])}
+
+        return Response (content_type = "application/json",
+                         body = json.dumps (jsondict, indent = 4))
+
+        
+    def list_client (self, req) :
+
+        print "list_client"
+
+        return Response (content_type = "application/json",
+                         body = json.dumps (self.rfwrt.arp, indent = 4))
